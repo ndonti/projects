@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
+"""
+Copyright (c) Ammolytics and contributors. All rights reserved.
+Released under the MIT license. See LICENSE file in the project root for details.
+
+OpenTrickler
+https://github.com/ammolytics/projects/tree/develop/trickler
+"""
 
 import datetime
 import decimal
 import logging
-
-import gpiozero
-import pymemcache.client.base
-import pymemcache.serde
+import time
 
 import PID
 import motors
 import scales
-
-
-memcache = pymemcache.client.base.Client('127.0.0.1:11211', serde=pymemcache.serde.PickleSerde())
 
 
 # Components:
@@ -25,81 +26,141 @@ memcache = pymemcache.client.base.Client('127.0.0.1:11211', serde=pymemcache.ser
 # 6. Bluetooth?
 # 7: Powder pan/cup?
 
-# Conditions:
-# 0: unknown/not ready
+# TODO
+# - add support for config input (configparse)
+# - document specific python version
+# - handle case where scale is booted with pan on -- shows error instead of negative value
+# - detect scale that's turned off (blank values)
+# - validate inputs (target weight)
 
 
-def trickler_loop(pid, trickler_motor, scale, args):
-    running = True
-    memcache.set('running', running)
+def is_even(dec):
+    """Returns True if a decimal.Decimal is even, False if odd."""
+    exp = dec.as_tuple().exponent
+    factor = 10 ** (exp * -1)
+    return (dec * factor) % 2 == 0
 
-    while running:
+
+def trickler_loop(memcache, pid, trickler_motor, scale, target_weight, target_unit, pidtune_logger):
+    pidtune_logger.info('timestamp, input (motor %), output (weight %)')
+    logging.info('Starting trickling process...')
+
+    while 1:
+        # Stop running if auto mode is disabled.
+        if not memcache.get('auto_mode'):
+            logging.debug('auto mode disabled.')
+            break
+
         # Read scale values (weight/unit/stable)
         scale.update()
-        # Read settings (on/off/target/etc)
-        auto_mode = memcache.get('auto_mode', args.auto_mode)
-        target_weight = memcache.get('target_weight', args.target_weight)
-        target_unit = memcache.get('target_unit', args.target_unit)
-        pid.SetPoint = float(target_weight)
-        logging.debug('auto_mode: %r, target_weight: %r, target_unit: %r', auto_mode, target_weight, target_unit)
 
-        # Set scale to match target unit.
-        if target_unit != scale.unit:
-            scale.change_unit(target_unit)
+        # Stop running if scale's unit no longer matches target unit.
+        if scale.unit != target_unit:
+            logging.debug('Target unit does not match scale unit.')
+            break
+
+        # Stop running if pan removed.
+        if scale.weight < 0:
+            logging.debug('Pan removed.')
+            break
 
         remainder_weight = target_weight - scale.weight
         logging.debug('remainder_weight: %r', remainder_weight)
 
-        if args.pid_tune:
-            print(f'{datetime.datetime.now().timestamp()}, {trickler_motor.speed}, {scale.weight / target_weight}')
-
-        # Powder pan in place.
-        if scale.weight >= 0 and auto_mode:
-            pid.update(float(scale.weight))
-            trickler_motor.update(pid.output)
-            logging.debug('trickler_motor.speed: %r, pid.output: %r', trickler_motor.speed, pid.output)
-        else:
-            # Pan removed.
-            # Turn off trickler motor.
-            trickler_motor.off()
-            logging.debug('Pan removed, motor turned off.')
+        pidtune_logger.info(
+            '%s, %s, %s',
+            datetime.datetime.now().timestamp(),
+            trickler_motor.speed,
+            scale.weight / target_weight)
 
         # Trickling complete.
         if remainder_weight <= 0:
-            # Turn off trickler motor.
-            trickler_motor.off()
-            # Clear PID values.
-            pid.clear()
             logging.debug('Trickling complete, motor turned off and PID reset.')
+            break
 
-        running = memcache.get('running', running)
+
+        pid.update(float(scale.weight))
+        trickler_motor.update(pid.output)
+        logging.debug('trickler_motor.speed: %r, pid.output: %r', trickler_motor.speed, pid.output)
+        logging.info(
+            'remainder: %s %s scale: %s %s motor: %s',
+            remainder_weight,
+            target_unit,
+            scale.weight,
+            scale.unit,
+            trickler_motor.speed)
+
+    # Clean up tasks.
+    trickler_motor.off()
+    # Clear PID values.
+    pid.clear()
+    logging.info('Trickling process stopped.')
 
 
-def main(args):
+def main(args, memcache, pidtune_logger):
     pid = PID.PID(args.pid_P, args.pid_I, args.pid_D)
-    trickler_motor = motors.TricklerMotor(args.trickler_motor_pin, min_pwm=args.min_pwm, max_pwm=args.max_pwm)
+    logging.debug('pid: %r', pid)
+
+    trickler_motor = motors.TricklerMotor(
+        memcache=memcache,
+        motor_pin=args.trickler_motor_pin,
+        min_pwm=args.min_pwm,
+        max_pwm=args.max_pwm)
+    logging.debug('trickler_motor: %r', trickler_motor)
     #servo_motor = gpiozero.AngularServo(args.servo_motor_pin)
 
     scale = scales.SCALES[args.scale](
+        memcache=memcache,
         port=args.scale_port,
         baudrate=args.scale_baudrate,
         timeout=args.scale_timeout)
+    logging.debug('scale: %r', scale)
 
     memcache.set('auto_mode', args.auto_mode)
     memcache.set('target_weight', args.target_weight)
     memcache.set('target_unit', scales.UNIT_MAP[args.target_unit])
 
-    trickler_loop(pid, trickler_motor, scale, args)
+    while 1:
+        # Update settings.
+        auto_mode = memcache.get('auto_mode', args.auto_mode)
+        target_weight = memcache.get('target_weight', args.target_weight)
+        target_unit = memcache.get('target_unit', args.target_unit)
+        pid.SetPoint = float(target_weight)
+        scale.update()
+
+        # Set scale to match target unit.
+        if target_unit != scale.unit:
+            scale.change_unit()
+
+        logging.info(
+            'target: %s %s scale: %s %s auto_mode: %s',
+            target_weight,
+            target_unit,
+            scale.weight,
+            scale.unit,
+            auto_mode)
+
+        # Powder pan in place, scale stable, ready to trickle.
+        if (scale.weight >= 0 and scale.weight < target_weight and scale.unit == target_unit
+                and scale.is_stable and auto_mode):
+            # Wait a second to start trickling.
+            time.sleep(1)
+            # Run trickler loop.
+            trickler_loop(memcache, pid, trickler_motor, scale, target_weight, target_unit, pidtune_logger)
 
 
 if __name__ == '__main__':
     import argparse
+    import distutils.util
+
+    import pymemcache.client.base
+    import pymemcache.serde
 
     parser = argparse.ArgumentParser(description='Run OpenTrickler.')
     parser.add_argument('--scale', choices=scales.SCALES.keys(), default='and-fx120')
     parser.add_argument('--scale_port', default='/dev/ttyUSB0')
     parser.add_argument('--scale_baudrate', type=int, default=19200)
-    parser.add_argument('--scale_timeout', type=float, default=0.05)
+    parser.add_argument('--scale_timeout', type=float, default=0.1)
     parser.add_argument('--trickler_motor_pin', type=int, default=18)
     #parser.add_argument('--servo_motor_pin', type=int)
     parser.add_argument('--max_pwm', type=float, default=100)
@@ -125,19 +186,28 @@ if __name__ == '__main__':
     # - minorly affect steady-state error
     # - improve stability
     parser.add_argument('--pid_D', type=float, default=3.75)
-    parser.add_argument('--auto_mode', type=bool, default=False)
+    parser.add_argument('--auto_mode', type=distutils.util.strtobool, default=False)
     parser.add_argument('--target_weight', type=decimal.Decimal, default=0)
     parser.add_argument('--target_unit', choices=scales.UNIT_MAP.keys(), default='GN')
-    parser.add_argument('--pid_tune', type=bool, default=False)
+    parser.add_argument('--pid_tune', type=distutils.util.strtobool, default=False)
+    parser.add_argument('--verbose', type=distutils.util.strtobool, default=False)
     args = parser.parse_args()
 
-    if args.pid_tune:
-        logging.basicConfig(level=logging.INFO)
-        print('timestamp, input (motor %), output (weight %)')
-    else:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s.%(msecs)06dZ %(levelname)-4s %(message)s',
-            datefmt='%Y-%m-%dT%H:%M:%S')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s.%(msecs)06dZ %(levelname)-4s %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S')
 
-    main(args)
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    pidtune_logger = logging.getLogger('pid_tune')
+    pid_handler = logging.StreamHandler()
+    pid_handler.setFormatter(logging.Formatter('%(message)s'))
+
+    pidtune_logger.setLevel(logging.ERROR)
+    if args.pid_tune:
+        pidtune_logger.setLevel(logging.INFO)
+
+    memcache_client = pymemcache.client.base.Client('127.0.0.1:11211', serde=pymemcache.serde.PickleSerde())
+    main(args, memcache_client, pidtune_logger)
